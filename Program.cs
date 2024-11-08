@@ -4,7 +4,7 @@ using NATS.Net;
 await using var client = new NatsClient();
 IDistributedLocker locker = new NatsDistributedLocker(client);
 Console.WriteLine("Trying...");
-await using (var handle = await locker.TryAcquire(args.First()))
+await using (var handle = await locker.Acquire(args.First()))
 {
     if (handle is null) return;
     Console.WriteLine("Became leader");
@@ -14,7 +14,7 @@ await using (var handle = await locker.TryAcquire(args.First()))
 public interface IDistributedLocker
 {
     /// <summary>
-    /// Tries to acquire a given lock, if it fails, it waits until the lock is freed.
+    /// Tries to acquire a given lock, if it fails, it blocks until the lock is freed.
     /// The lock has a TTL of 3 seconds and is renewed in the background every second. If the program crashes, the lock will be freed after at most 3 seconds, and can be acquired by another process.
     /// </summary>
     /// <param name="key">A string specifying a name that identifies the lock resource.</param>
@@ -23,7 +23,7 @@ public interface IDistributedLocker
 
     /// <summary>
     /// Tries to acquire a given lock; returns `null` if the lock isn't free immediately.
-    /// The lock has a TTL of 3 seconds and is renewed in the background every second. If the program crashes, the lock will be freed after at most 3 seconds, and can be acquired by another process.
+    /// The lock has a TTL of 3 seconds and is periodically renewed in the background until the lock is disposed. If the program crashes, the lock will be freed after at most 3 seconds, and can be acquired by another process.
     /// </summary>
     /// <param name="key">A string specifying a name that identifies the lock resource.</param>
     /// <returns>An <see cref="IAsyncDisposable"/> that frees the lock when disposed, or `null` if the lock wasn't acquired.</returns>
@@ -35,11 +35,12 @@ public class NatsDistributedLocker(
 ) : IDistributedLocker
 {
     private const string LockStoreName = "_locks";
+    private static readonly TimeSpan Ttl = TimeSpan.FromSeconds(3);
     private readonly Task<INatsKVStore> _kv = natsClient
         .CreateKeyValueStoreContext()
         .CreateStoreAsync(new NatsKVConfig(LockStoreName)
         {
-            MaxAge = TimeSpan.FromSeconds(3),
+            MaxAge = Ttl,
         })
         .AsTask();
 
@@ -53,7 +54,7 @@ public class NatsDistributedLocker(
 
             CancellationTokenSource cts = new();
             _ = RefreshLock(cts.Token);
-            return new Disposable(async () =>
+            return new Lock(async () =>
             {
                 Console.WriteLine("Disposing...");
                 cts.Cancel();
@@ -69,7 +70,9 @@ public class NatsDistributedLocker(
         {
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(1_000, ct);
+                // var refreshFrequency = (int)Ttl.TotalMilliseconds / 3;
+                var refreshFrequency = 10_000;
+                await Task.Delay(refreshFrequency, ct);
                 rev = await kv.UpdateAsync(key, "", rev, cancellationToken: ct);
             }
         }
@@ -85,7 +88,7 @@ public class NatsDistributedLocker(
 
             CancellationTokenSource cts = new();
             _ = RefreshLock(cts.Token);
-            return new Disposable(async () =>
+            return new Lock(async () =>
             {
                 Console.WriteLine("Disposing...");
                 cts.Cancel();
@@ -108,14 +111,16 @@ public class NatsDistributedLocker(
         {
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(1_000, ct);
+                // var refreshFrequency = (int)Ttl.TotalMilliseconds / 3;
+                var refreshFrequency = 10_000;
+                await Task.Delay(refreshFrequency, ct);
                 rev = await kv.UpdateAsync(key, "", rev, cancellationToken: ct);
             }
         }
     }
 
-    private class Disposable(Func<ValueTask> dispose) : IAsyncDisposable
+    private class Lock(Func<ValueTask> free) : IAsyncDisposable
     {
-        public ValueTask DisposeAsync() => dispose();
+        public ValueTask DisposeAsync() => free();
     }
 }
