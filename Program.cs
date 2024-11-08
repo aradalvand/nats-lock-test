@@ -22,9 +22,36 @@ public class NatsDistributedLocker(
 {
     private const string LockStoreName = "_locks";
 
-    public Task<IAsyncDisposable> LockOrGiveUp(string key)
+    public async Task<IAsyncDisposable> LockOrGiveUp(string key)
     {
-        throw new NotImplementedException();
+        var kv = await natsClient.CreateKeyValueStoreContext().CreateStoreAsync(LockStoreName);
+        ulong rev;
+        try
+        {
+            rev = await kv.CreateAsync(key, "");
+
+            CancellationTokenSource cts = new();
+            _ = RefreshLock(cts.Token);
+            return new Disposable(async () =>
+            {
+                Console.WriteLine("Disposing...");
+                cts.Cancel();
+                await kv.DeleteAsync(key);
+            });
+        }
+        catch (Exception ex) when (ex is NatsKVCreateException or NatsKVWrongLastRevisionException)
+        {
+            throw new Exception("Lock couldn't be acquired.");
+        }
+
+        async Task RefreshLock(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(100_000_000, ct);
+                rev = await kv.UpdateAsync(key, "", rev, cancellationToken: ct);
+            }
+        }
     }
 
     public async Task<IAsyncDisposable> LockOrWait(string key)
@@ -44,23 +71,14 @@ public class NatsDistributedLocker(
                 await kv.DeleteAsync(key);
             });
         }
-        catch (NatsKVCreateException)
+        catch (Exception ex) when (ex is NatsKVCreateException or NatsKVWrongLastRevisionException)
         {
             await foreach (var entry in kv.WatchAsync<string>(key))
             {
                 if (entry.Operation is not NatsKVOperation.Del)
                     continue;
 
-                rev = await kv.CreateAsync(key, "");
-
-                CancellationTokenSource cts = new();
-                _ = RefreshLock(cts.Token);
-                return new Disposable(async () =>
-                {
-                    Console.WriteLine("Disposing...");
-                    cts.Cancel();
-                    await kv.DeleteAsync(key);
-                });
+                return await LockOrWait(key);
             }
             throw new Exception("Couldn't acquire the lock.");
         }
@@ -69,7 +87,7 @@ public class NatsDistributedLocker(
         {
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(10_000, ct);
+                await Task.Delay(100_000_000, ct);
                 rev = await kv.UpdateAsync(key, "", rev, cancellationToken: ct);
             }
         }
