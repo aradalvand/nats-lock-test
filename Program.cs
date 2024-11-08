@@ -42,6 +42,7 @@ public interface ILockHandle : IAsyncDisposable
     /// <summary>
     /// If the lease isn't refreshed in time, the next time the refresh is attempted, we'll get an error,
     /// which signals that the lock has been acquired by another process, we need to kill our process once this happens.
+    /// Represents a cancellation token that is canceled at that point.
     /// </summary>
     CancellationToken CancellationToken { get; }
 }
@@ -74,7 +75,7 @@ public class NatsDistributedLocker(
             {
                 Console.WriteLine("Disposing...");
                 cts.Cancel();
-                await kv.DeleteAsync(key);
+                await kv.DeleteAsync(key, new() { Revision = rev });
             }, cts.Token);
         }
         catch (Exception ex) when (ex is NatsKVCreateException or NatsKVWrongLastRevisionException)
