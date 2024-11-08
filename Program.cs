@@ -80,6 +80,7 @@ public class NatsDistributedLocker(
         }
         catch (Exception ex) when (ex is NatsKVCreateException or NatsKVWrongLastRevisionException)
         {
+            // NOTE: NATS offers almost instantaneous ZooKeeper-like "event-driven waits" via its "watch" mechanism — see https://github.com/madelson/DistributedLock/blob/master/docs/DistributedLock.ZooKeeper.md#:~:text=By%20leveraging%20ZooKeeper%20watches%20under%20the%20hood%2C%20these%20recipes%20allow%20for%20very%20efficient%20event%2Ddriven%20waits%20when%20acquiring.
             await foreach (var entry in kv.WatchAsync<string>(key))
             {
                 if (entry.Operation is not NatsKVOperation.Del) // todo: automatic deletion due to `maxage` doesn't result in a `del` so we won't be notified
