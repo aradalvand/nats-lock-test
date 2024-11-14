@@ -27,9 +27,10 @@ await Main();
 public interface ILockHandle : IAsyncDisposable
 {
     /// <summary>
-    /// If the lock isn't renewed in time, the next time the refresh is attempted, we'll get an error,
-    /// which signals that the lock has been acquired by another process, we need to kill our process once this happens.
-    /// Represents a cancellation token that is canceled at that point, or when the token passed to `Acquire` is canceled (making it a superset of the initial cancellation token).
+    /// If the lock fails to be renewed in time (due to server hanging, or network partitions that make NATS temporarily inaccessible),
+    /// the next time the refresh is attempted, we'll get an error if the lock has already been re-acquired by another process,
+    /// In such a scenario, the previous leader (this instance) should abort its process.
+    /// This property represents a cancellation token that is canceled in the aforementioned point, or when the token passed to called method of `IDistributeLocker` is canceled (making it a superset of that original cancellation token).
     /// </summary>
     CancellationToken CancellationToken { get; }
 }
@@ -46,6 +47,7 @@ public class NatsDistributedLocker(
             .CreateKeyValueStoreContext()
             .CreateStoreAsync(new NatsKVConfig(KvStoreName)
             {
+                // NOTE: We only really care about the last state of any lock, so we leave the `History` option to its default value which is 1. See https://docs.nats.io/nats-concepts/jetstream/key-value-store/kv_walkthrough#watching-a-k-v-store:~:text=By%20default%2C%20the%20KV%20bucket%20has%20a%20history%20size%20of%20one
                 MaxAge = Ttl, // todo: should be set on a per-key basis, preferably — pending https://github.com/nats-io/nats-server/issues/3251#issuecomment-2371195906
             })
     );
@@ -70,7 +72,7 @@ public class NatsDistributedLocker(
             // todo: race condition
             await foreach (var entry in kv.WatchAsync<string>(key, opts: new()
             {
-                // NOTE: By default, NATS KV stores will keep a history of 1, meaning the last state of the key (including 'DELETE'). We want to set this particular watch configuration to `true` so as to account for a possible race condition in which the key fails to be acquired, then the leader deletes it, but only "after" that do we begin watching the key for changes (waiting for it to be deleted, not knowing that it already has).
+                // NOTE: By default, NATS KV stores will keep a history of 1, meaning the last state of the key (including 'DELETE'). We want to set this particular watch configuration to `true` in order to account for a possible race condition in which the key fails to be acquired (hence the invocation of this func), then the current leader releases it (leaving a `Del` marker in the key's history), but then *after* that, we begin watching the key for changes (waiting for it to be deleted, not knowing that it already has been).
                 // todo: the only scenario this doesn't cover is when the lock is deleted via the bucket-wide TTL (i.e. `MaxAge`) — (hopefully) pending https://github.com/nats-io/nats-server/issues/3268
                 IncludeHistory = true,
             }, cancellationToken: ct))
