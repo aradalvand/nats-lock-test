@@ -4,13 +4,18 @@ using NATS.Client.Core;
 using NATS.Client.KeyValueStore;
 using NATS.Net;
 
-async Task Main()
+async Task Main(CancellationToken ct)
 {
     await using var client = new NatsClient();
     var locker = new NatsDistributedLocker(client);
     Console.WriteLine("Trying...");
 
-    await using var handle = await locker.AcquireOrStandBy(args.First(), Main);
+    if (TryFoo(out ct))
+    {
+
+    }
+
+    await using var handle = await locker.AcquireOrStandBy(args.First(), () => Main(ct), ct);
     _ = Task.Run(async () =>
     {
         while (!handle.CancellationToken.IsCancellationRequested)
@@ -22,7 +27,13 @@ async Task Main()
     Console.WriteLine("Became leader");
     Console.ReadLine();
 }
-await Main();
+
+bool TryFoo(out CancellationToken foo)
+{
+
+}
+
+await Main(default);
 
 public interface ILockHandle : IAsyncDisposable
 {
