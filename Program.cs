@@ -38,14 +38,14 @@ public class NatsDistributedLocker(
     INatsClient natsClient
 )
 {
-    private const string KvStoreName = "locks";
+    private const string KvStoreName = "locks2";
     private static readonly TimeSpan Ttl = TimeSpan.FromSeconds(5);
     private readonly Lazy<Task<INatsKVStore>> _kvStore = new(async () =>
         await natsClient
             .CreateKeyValueStoreContext()
             .CreateStoreAsync(new NatsKVConfig(KvStoreName)
             {
-                MaxAge = Ttl, // todo: should be set on a per-key basis, preferably — pending https://github.com/nats-io/nats-server/issues/3251#issuecomment-2371195906
+                // MaxAge = Ttl, // todo: should be set on a per-key basis, preferably — pending https://github.com/nats-io/nats-server/issues/3251#issuecomment-2371195906
             })
     );
 
@@ -69,6 +69,8 @@ public class NatsDistributedLocker(
             // todo: race condition
             await foreach (var entry in kv.WatchAsync<string>(key, opts: new()
             {
+                // NOTE: By default, NATS KV stores will keep a history of 1, meaning the last state of the key (including 'DELETE'). We want to set this particular watch configuration to `true` so as to account for a possible race condition in which the key fails to be acquired, then the leader deletes it, but only "after" that do we begin watching the key for changes (waiting for it to be deleted, not knowing that it already has).
+                // todo: the scenario where this doesn't work is ttl — (hopefully) pending https://github.com/nats-io/nats-server/issues/3268
                 IncludeHistory = true,
             }, cancellationToken: ct))
             {
@@ -105,7 +107,7 @@ public class NatsDistributedLocker(
                 cts.Cancel();
                 try
                 {
-                    await kvStore.DeleteAsync(key, new() { Revision = revisionNumber });
+                    await kvStore.DeleteAsync(key, new() { Revision = revisionNumber, Purge = false });
                 }
                 catch { } // NOTE: Delete might throw if the revision number is stale, but that would mean another process has acquired the lock (due to us failing to refresh the lock in time) — but we don't care (hence the "swallowing" of the exception) because our goal of having the lock be released by us will effectively have been achieved.
                 // logger.LogInformation("Lock {Key} released.", key);
