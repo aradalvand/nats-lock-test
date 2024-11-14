@@ -38,14 +38,15 @@ public class NatsDistributedLocker(
     INatsClient natsClient
 )
 {
-    private const string KvStoreName = "locks2";
+    private const string KvStoreName = "locks";
     private static readonly TimeSpan Ttl = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan RenewalFrequency = TimeSpan.FromSeconds(2);
     private readonly Lazy<Task<INatsKVStore>> _kvStore = new(async () =>
         await natsClient
             .CreateKeyValueStoreContext()
             .CreateStoreAsync(new NatsKVConfig(KvStoreName)
             {
-                // MaxAge = Ttl, // todo: should be set on a per-key basis, preferably — pending https://github.com/nats-io/nats-server/issues/3251#issuecomment-2371195906
+                MaxAge = Ttl, // todo: should be set on a per-key basis, preferably — pending https://github.com/nats-io/nats-server/issues/3251#issuecomment-2371195906
             })
     );
 
@@ -70,7 +71,7 @@ public class NatsDistributedLocker(
             await foreach (var entry in kv.WatchAsync<string>(key, opts: new()
             {
                 // NOTE: By default, NATS KV stores will keep a history of 1, meaning the last state of the key (including 'DELETE'). We want to set this particular watch configuration to `true` so as to account for a possible race condition in which the key fails to be acquired, then the leader deletes it, but only "after" that do we begin watching the key for changes (waiting for it to be deleted, not knowing that it already has).
-                // todo: the scenario where this doesn't work is ttl — (hopefully) pending https://github.com/nats-io/nats-server/issues/3268
+                // todo: the only scenario this doesn't cover is when the lock is deleted via the bucket-wide TTL (i.e. `MaxAge`) — (hopefully) pending https://github.com/nats-io/nats-server/issues/3268
                 IncludeHistory = true,
             }, cancellationToken: ct))
             {
@@ -115,10 +116,8 @@ public class NatsDistributedLocker(
 
             async Task Renew()
             {
-                var refreshFrequency = TimeSpan.FromMilliseconds(Ttl.TotalMilliseconds / 3);
-
                 int x = 0;
-                while (await refreshFrequency.WaitAsync(cts.Token))
+                while (await RenewalFrequency.WaitAsync(cts.Token))
                 {
                     // todo: what if the revision number is stale and this call throws here?
                     Console.WriteLine($"{++x}. renewing lock (rev: {revisionNumber})");
