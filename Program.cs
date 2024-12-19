@@ -8,29 +8,19 @@ async Task Main(CancellationToken ct)
 {
     await using var client = new NatsClient();
     var locker = new NatsDistributedLocker(client);
-    Console.WriteLine("Trying...");
 
-    if (TryFoo(out ct))
-    {
-
-    }
-
-    await using var handle = await locker.AcquireOrStandBy(args.First(), () => Main(ct), ct);
+    Console.WriteLine("Trying for lock...");
+    await using var handle = await locker.AcquireOrStandBy(args.First(), () => Main(ct), ref ct);
     _ = Task.Run(async () =>
     {
-        while (!handle.CancellationToken.IsCancellationRequested)
+        while (!ct.IsCancellationRequested)
         {
-            await Task.Delay(1000, handle.CancellationToken);
+            await Task.Delay(1000, ct);
             Console.WriteLine($"--- doing work ----");
         }
     }); // see https://stackoverflow.com/a/48971668/7734384
     Console.WriteLine("Became leader");
     Console.ReadLine();
-}
-
-bool TryFoo(out CancellationToken foo)
-{
-
 }
 
 await Main(default);
@@ -43,7 +33,7 @@ public interface ILockHandle : IAsyncDisposable
     /// In such a scenario, the previous leader (this instance) should abort its process.
     /// This property represents a cancellation token that is canceled in the aforementioned point, or when the token passed to called method of `IDistributeLocker` is canceled (making it a superset of that original cancellation token).
     /// </summary>
-    CancellationToken CancellationToken { get; }
+    // CancellationToken CancellationToken { get; }
 }
 
 public class NatsDistributedLocker(
@@ -63,18 +53,35 @@ public class NatsDistributedLocker(
             })
     );
 
-    // public async Task<ILockHandle?> TryAcquire(string key, CancellationToken ct = default)
-    // {
-    //     var acquiredLock = await Acquire(
-    //         key, _ => ValueTask.FromResult<ILockHandle?>(null),
-    //         ct
-    //     );
-    //     return acquiredLock;
-    // }
-
-    public async Task<ILockHandle> AcquireOrStandBy(string key, Func<Task> operation, CancellationToken ct = default)
+    public Task<ILockHandle?> TryAcquire(string key, ref CancellationToken ct)
     {
-        var acquiredLock = await Acquire(key, async kv =>
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        ct = cts.Token;
+        var acquiredLock = Acquire(
+            key: key,
+            failure: _ => ValueTask.FromResult<ILockHandle?>(null),
+            operation: () => Task.CompletedTask,
+            cts
+        );
+        return acquiredLock;
+    }
+
+
+    public Task<ILockHandle> AcquireOrStandBy(
+        string key,
+        Func<Task> operation,
+        ref CancellationToken ct // NOTE: We use `ref` because https://stackoverflow.com/questions/10366378/how-to-tell-if-an-out-parameter-was-set-already#:~:text=If%20you%20want%20a%20parameter%20which%20carries%20information%20as%20input%20to%20the%20method%20as%20well%20as%20propagating%20information%20out%2C%20you%20should%20use%20ref%20instead%20of%20out.
+    )
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        ct = cts.Token;
+        return AcquireOrStandBy2(key, operation, cts);
+    }
+
+    private Task<ILockHandle> AcquireOrStandBy2(string key, Func<Task> operation, CancellationTokenSource cts)
+    {
+        // NOTE: The workaround that allows us to have `ref`/`in`/`out` parameters in async methods: https://stackoverflow.com/a/20868150/7734384
+        var acquiredLock = Acquire(key, async kv =>
         {
             // NOTE: NATS offers almost instantaneous ZooKeeper-like "event-driven waits" via its "watch" mechanism — see https://github.com/madelson/DistributedLock/blob/master/docs/DistributedLock.ZooKeeper.md#:~:text=By%20leveraging%20ZooKeeper%20watches%20under%20the%20hood%2C%20these%20recipes%20allow%20for%20very%20efficient%20event%2Ddriven%20waits%20when%20acquiring.
             Console.WriteLine("1");
@@ -86,34 +93,29 @@ public class NatsDistributedLocker(
                 // NOTE: By default, NATS KV stores will keep a history of 1, meaning the last state of the key (including 'DELETE'). We want to set this particular watch configuration to `true` in order to account for a possible race condition in which the key fails to be acquired (hence the invocation of this func), then the current leader releases it (leaving a `Del` marker in the key's history), but then *after* that, we begin watching the key for changes (waiting for it to be deleted, not knowing that it already has been).
                 // todo: the only scenario this doesn't cover is when the lock is deleted via the bucket-wide TTL (i.e. `MaxAge`) — (hopefully) pending https://github.com/nats-io/nats-server/issues/3268
                 IncludeHistory = true,
-            }, cancellationToken: ct))
+            }, cancellationToken: cts.Token))
             {
-                Console.WriteLine($"Watch entry: {entry}");
-                if (entry.Operation is not NatsKVOperation.Del) // todo: automatic deletion due to `maxage` doesn't result in a `del` so we won't be notified — we are pending https://github.com/nats-io/nats-server/issues/3268
-                    continue;
-
-                return await AcquireOrStandBy(key, operation, ct);
+                if (entry.Operation is NatsKVOperation.Del) // todo: automatic deletion due to `maxage` doesn't result in a `del` so we won't be notified — we are pending https://github.com/nats-io/nats-server/issues/3268
+                    return await AcquireOrStandBy2(key, operation, cts);
             }
 
             throw new UnreachableException();
-        }, operation, ct);
+        }, operation, cts);
         return acquiredLock!;
     }
-
     private async Task<ILockHandle?> Acquire(
         string key,
         Func<INatsKVStore, ValueTask<ILockHandle?>> failure,
         Func<Task> operation,
-        CancellationToken ct
+        CancellationTokenSource cts
     )
     {
         var kvStore = await _kvStore.Value;
         ulong revisionNumber;
         try
         {
-            revisionNumber = await kvStore.CreateAsync<object?>(key, null, cancellationToken: ct); // NOTE: The cancellation token should only be used for the initial
+            revisionNumber = await kvStore.CreateAsync<object?>(key, null, cancellationToken: cts.Token); // NOTE: The cancellation token should only be used for the initial
 
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _ = Renew(); // todo: is this safe or should we store the task somewhere?
             return new Lock(release: async () =>
             {
@@ -149,7 +151,7 @@ public class NatsDistributedLocker(
                     }
                     catch (NatsKVWrongLastRevisionException ex)
                     {
-                        Console.WriteLine($"Renewing lock failed — aborting operation and retrying: {ex}");
+                        Console.WriteLine($"Failed to renew lock in time — aborting operation and retrying: {ex}");
                         cts.Cancel();
                         await operation(); // NOTE: Effectively re-invoking the operation to begin competing for the lock again
                     }
@@ -164,7 +166,6 @@ public class NatsDistributedLocker(
 
     private class Lock(Func<ValueTask> release, CancellationToken ct) : ILockHandle
     {
-        public CancellationToken CancellationToken => ct;
         public ValueTask DisposeAsync() => release();
     }
 }
